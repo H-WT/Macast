@@ -1,5 +1,6 @@
 # Copyright (c) 2021 by xfangfang. All Rights Reserved.
 # Modified for MPV proper support, fullscreen on start, with IPC control.
+# Seamless switching via loadfile replace without restarting MPV process.
 #
 # Macast Metadata
 # <macast.title>MPVPlayer Renderer</macast.title>
@@ -89,14 +90,20 @@ class MPVplayerRenderer(Renderer):
 
     def send_command(self, command):
         """向 MPV 发送 IPC 命令"""
+        if self.ipc_sock is None:
+            logger.error("IPC socket is None, cannot send command")
+            return False
+
         data = {"command": command}
         msg = json.dumps(data) + "\n"
         with self.command_lock:
             try:
                 if os.name == 'nt':
-                    self.ipc_sock.send(msg.encode())
+                    # Windows 命名管道使用 send_bytes
+                    self.ipc_sock.send_bytes(msg.encode())
                 else:
                     self.ipc_sock.sendall(msg.encode())
+                logger.debug(f"Command sent: {command}")
                 return True
             except Exception as e:
                 logger.error(f"send_command failed: {e}")
@@ -214,17 +221,25 @@ class MPVplayerRenderer(Renderer):
             event = data["event"]
             if event == "start-file":
                 self._playing = True
+                # 通知上层有新 URI
                 cherrypy.engine.publish("renderer_av_uri", self.protocol.get_state_url())
+                # 状态由 playback-restart 事件设置，此处不重复设置
             elif event == "end-file":
                 self._playing = False
                 self._position = 0
-                self.set_state_stop()
+                # 不立即设置 STOPPED，等待后续事件（start-file 或 idle）
+                # 如果是主动停止，状态会由 set_media_stop 手动设置
                 cherrypy.engine.publish("renderer_av_stop")
             elif event == "playback-restart":
+                # 播放准备就绪，根据暂停状态设置
                 if self._pause:
                     self.set_state_pause()
                 else:
                     self.set_state_play()
+            elif event == "idle":
+                # 播放结束进入空闲
+                self._playing = False
+                self.set_state_stop()
 
     def _update_position_state(self):
         """更新播放进度状态"""
@@ -239,17 +254,20 @@ class MPVplayerRenderer(Renderer):
         self.set_state_duration(dur_str)
 
     def _start_ipc_thread(self):
-        """启动 IPC 线程"""
+        """启动 IPC 线程（确保旧线程已结束）"""
         if self.ipc_thread and self.ipc_thread.is_alive():
-            return
+            self.ipc_running = False
+            self.ipc_thread.join(timeout=2)
+            if self.ipc_thread.is_alive():
+                logger.warning("IPC thread did not stop in time")
         self.ipc_thread = threading.Thread(target=self._ipc_loop, daemon=True)
         self.ipc_thread.start()
 
     # ==================== DLNA 控制方法 ====================
 
     def set_media_stop(self):
-        """停止播放"""
-        self.send_command(["stop"])
+        """停止播放（用户主动停止或进程退出时调用）"""
+        # 终止 MPV 进程
         if self.process:
             try:
                 self.process.terminate()
@@ -262,18 +280,35 @@ class MPVplayerRenderer(Renderer):
             self.process = None
             self.pid = None
 
+        # 停止 IPC 线程
         self.ipc_running = False
         if self.ipc_thread and self.ipc_thread.is_alive():
             self.ipc_thread.join(timeout=2)
+            if self.ipc_thread.is_alive():
+                logger.warning("IPC thread still alive after join")
+        self.ipc_thread = None  # 清除引用
 
+        # 清理套接字
+        if self.ipc_sock:
+            try:
+                self.ipc_sock.close()
+            except:
+                pass
+            self.ipc_sock = None
+
+        # 删除临时字幕文件
         try:
             if os.path.exists(subtitle):
                 os.remove(subtitle)
         except Exception as e:
             logger.warning(f"Failed to remove subtitle: {e}")
 
+        # 更新状态
+        self._playing = False
+        self._position = 0
         self.set_state_transport("STOPPED")
         cherrypy.engine.publish("renderer_av_stop")
+        logger.info("Media stopped")
 
     def set_media_pause(self):
         """暂停"""
@@ -289,16 +324,13 @@ class MPVplayerRenderer(Renderer):
 
     def set_media_position(self, data):
         """跳转到指定位置 (格式: 00:00:00)"""
-        # 解析时间字符串为秒
         parts = data.split(":")
         if len(parts) == 3:
             seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
             self.send_command(["seek", seconds, "absolute"])
 
     def set_media_url(self, url, start=0):
-        """播放新 URL"""
-        self.set_media_stop()
-
+        """播放新 URL（支持无缝切换）"""
         mpv_path = get_mpv_path()
         if not mpv_path:
             subprocess.Popen(["notepad.exe", Setting.setting_path],
@@ -307,12 +339,32 @@ class MPVplayerRenderer(Renderer):
                 "MPV not found. Please set 'MPVplayer_Path' in config.")
             return
 
-        # 构建命令行
+        # 如果已有 MPV 进程且正在运行，直接发送 loadfile 命令进行切换
+        if self.process and self.process.poll() is None:
+            # 构造 loadfile 命令，使用 replace 模式
+            cmd = ["loadfile", url, "replace"]
+            if start:
+                cmd.append(f"start={start}")
+            logger.info(f"Sending loadfile replace: {cmd}")
+            success = self.send_command(cmd)
+            if success:
+                logger.info(f"Switched to new URL: {url}")
+                # 主动设置状态为 PLAYING（后续事件会修正）
+                self.set_state_transport("PLAYING")
+                cherrypy.engine.publish("renderer_av_uri", url)
+                return
+            else:
+                logger.error("IPC send failed, fallback to restart")
+                # 发送失败，降级为重启进程
+                self.set_media_stop()
+
+        # 没有进程或进程已退出，则启动新 MPV 进程
+        # 先确保旧进程完全清理（已在上面执行）
         cmd = [
             mpv_path,
             url,
             "--fullscreen",
-            f"--input-ipc-server={self.mpv_sock}",   # 关键：启用 IPC
+            f"--input-ipc-server={self.mpv_sock}",
             "--cache=yes",
             "--keep-open=yes",
             "--no-terminal",
@@ -321,6 +373,7 @@ class MPVplayerRenderer(Renderer):
             cmd.append(f"--sub-file={subtitle}")
 
         try:
+            logger.info(f"Starting MPV with command: {cmd}")
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -332,15 +385,18 @@ class MPVplayerRenderer(Renderer):
             # 启动 IPC 线程
             self._start_ipc_thread()
 
-            # 等待进程结束（在独立线程中运行，不阻塞主线程）
+            # 等待进程结束的线程（不阻塞主线程）
             def wait_for_process():
                 self.process.wait()
                 logger.info("MPV process exited")
+                # 进程退出后清理状态
                 if self.process is not None and self.process.poll() is not None:
-                    self.set_media_stop()
+                    # 使用 Timer 避免与主线程冲突
+                    threading.Timer(0.5, self.set_media_stop).start()
 
             threading.Thread(target=wait_for_process, daemon=True).start()
 
+            # 设置初始状态
             self.set_state_transport("PLAYING")
             cherrypy.engine.publish("renderer_av_uri", url)
 
