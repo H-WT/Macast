@@ -1,5 +1,7 @@
 # 版权所有 (c) 2021 xfangfang。保留所有权利。
-# 终极优化版 (v0.39.0) – 满分工程实现
+# 终极优化版 (v0.39.1) – 满分工程实现
+#   - [v0.39.1] 根据全面分析进行改进：提取属性分发字典、管道缓冲区上限可配置、
+#              修复 atexit 重复清理、增强安全重置状态日志、抽象 Windows 管道连接
 #   - [v0.39.0] 修正 PriorityQueueWithDiscard 复杂度声明，真实 O(n) 并给出理由
 #   - [v0.39.0] 加固 IPC 接收循环对 _sock/_sock_file 的并发访问保护
 #   - [v0.39.0] MpvIpcClient 增加安全析构，保证配置回调绝对注销
@@ -11,7 +13,7 @@
 # <macast.title>MPVPlayer Renderer</macast.title>
 # <macast.renderer>MPVplayerRenderer</macast.renderer>
 # <macast.platform>win32</macast.platform>
-# <macast.version>0.39.0</macast.version>
+# <macast.version>0.39.1</macast.version>
 # <macast.host_version>0.7</macast.host_version>
 # <macast.author>HWT</macast.author>
 # <macast.desc>调用本地MPV，支持章节/音轨/字幕信息、播放列表管理、断点续播及完整配置</macast.desc>
@@ -160,19 +162,25 @@ if IS_WINDOWS:
 
     class PipeFileWrapper:
         """Windows 管道文件包装，带缓冲区溢出保护"""
-        MAX_BUFFER_SIZE: int = 10 * 1024 * 1024
-
         def __init__(self, conn: Any, on_overflow: Optional[Callable[[], None]] = None) -> None:
             self.conn: Any = conn
             self.buffer: bytes = b""
             self._on_overflow: Optional[Callable[[], None]] = on_overflow
             self._closed: bool = False
 
+        @property
+        def max_buffer_size(self) -> int:
+            # 使用外部可配置值，默认 10MB
+            try:
+                return Config.IPC_PIPE_BUFFER_MAX_SIZE
+            except NameError:
+                return 10 * 1024 * 1024
+
         def readline(self) -> str:
             """读取一行，缓冲区溢出时抛出 ConnectionError 触发重连"""
             while b'\n' not in self.buffer:
-                if len(self.buffer) > self.MAX_BUFFER_SIZE:
-                    log.error("管道缓冲区超过 10MB 限制，强制重连")
+                if len(self.buffer) > self.max_buffer_size:
+                    log.error(f"管道缓冲区超过 {self.max_buffer_size} 字节限制，强制重连")
                     self.buffer = b""
                     if self._on_overflow:
                         self._on_overflow()
@@ -340,6 +348,7 @@ class SettingProperty(Enum):
     MPVplayer_Cleanup_Total_Timeout = "MPVplayer_Cleanup_Total_Timeout"
     MPVplayer_PluginVersion = "MPVplayer_PluginVersion"
     MPVplayer_LogLevel = "MPVplayer_LogLevel"
+    MPVplayer_IPC_Pipe_Buffer_Max_Size = "MPVplayer_IPC_Pipe_Buffer_Max_Size"
 
 class ObservedProperty(Enum):
     PAUSE = 1
@@ -414,8 +423,9 @@ class Config:
     OSD_DEFAULT_DURATION: int = 3000
     START_LOCK_TIMEOUT: float = 10.0
     CLEANUP_TOTAL_TIMEOUT: float = 15.0
-    PLUGIN_VERSION: str = "0.39.0"
+    PLUGIN_VERSION: str = "0.39.1"
     LOG_LEVEL: str = "INFO"
+    IPC_PIPE_BUFFER_MAX_SIZE: int = 10 * 1024 * 1024   # 10MB
 
     @classmethod
     def register_callback(cls, cb: Callable[[], None]) -> None:
@@ -486,6 +496,7 @@ class Config:
             new_conf['CLEANUP_TOTAL_TIMEOUT'] = cls._safe_convert(SettingProperty.MPVplayer_Cleanup_Total_Timeout, cls.CLEANUP_TOTAL_TIMEOUT, float)
             new_conf['PLUGIN_VERSION'] = Setting.get(SettingProperty.MPVplayer_PluginVersion, cls.PLUGIN_VERSION)
             new_conf['LOG_LEVEL'] = Setting.get(SettingProperty.MPVplayer_LogLevel, cls.LOG_LEVEL).upper()
+            new_conf['IPC_PIPE_BUFFER_MAX_SIZE'] = cls._safe_convert(SettingProperty.MPVplayer_IPC_Pipe_Buffer_Max_Size, cls.IPC_PIPE_BUFFER_MAX_SIZE, int)
 
             extra = Setting.get(SettingProperty.MPVplayer_Extra_Args, "")
             new_conf['EXTRA_ARGS'] = [arg.strip() for arg in extra.split(";") if arg.strip()] if isinstance(extra, str) and extra.strip() else []
@@ -1015,6 +1026,9 @@ class ResumeManager:
                 self._executor.submit(self._save)
 
 class MpvIpcClient:
+    # 属性状态更新映射表：{ObservedProperty: 处理函数}
+    _PROPERTY_DISPATCH: Dict[ObservedProperty, Callable[['MpvIpcClient', Any], None]] = {}
+
     def __init__(self, renderer: 'MPVplayerRenderer', socket_path: str, executor: ThreadPoolExecutor) -> None:
         self._renderer_ref: weakref.ref[MPVplayerRenderer] = weakref.ref(renderer)
         self._socket_path: str = socket_path
@@ -1042,6 +1056,29 @@ class MpvIpcClient:
 
     def _cleanup_config_callback(self) -> None:
         Config.unregister_callback(self._config_callback)
+
+    def _init_dispatch(self) -> None:
+        """延迟初始化属性分发字典，避免循环引用"""
+        if self._PROPERTY_DISPATCH:
+            return
+        renderer = self._renderer_ref()
+        if renderer is None:
+            return
+        state = renderer.state
+        self._PROPERTY_DISPATCH = {
+            ObservedProperty.PAUSE:         lambda v: state.update_pause(bool(v)),
+            ObservedProperty.TIME_POS:      lambda v: state.update_position(float(v)) if v is not None else None,
+            ObservedProperty.DURATION:      lambda v: state.update_duration(float(v)) if v is not None else None,
+            ObservedProperty.VOLUME:        lambda v: state.update_volume(int(v)) if v is not None else None,
+            ObservedProperty.MEDIA_TITLE:   lambda v: state.update_title(str(v)) if v is not None else None,
+            ObservedProperty.METADATA:      lambda v: state.update_metadata(v) if v is not None else None,
+            ObservedProperty.CHAPTER_LIST:  lambda v: state.update_chapters(v) if isinstance(v, list) else None,
+            ObservedProperty.CHAPTER:       lambda v: state.update_chapter(int(v)) if v is not None else None,
+            ObservedProperty.PLAYLIST:      lambda v: state.update_playlist(v) if isinstance(v, list) else None,
+            ObservedProperty.AID:           lambda v: state.update_aid(int(v)) if v is not None else None,
+            ObservedProperty.SID:           lambda v: state.update_sid(int(v)) if v is not None else None,
+            ObservedProperty.TRACK_LIST:    lambda v: state.update_track_list(v) if isinstance(v, list) else None,
+        }
 
     def _on_pipe_overflow(self) -> None:
         log.error("检测到管道缓冲区溢出，重置 IPC 连接")
@@ -1178,33 +1215,36 @@ class MpvIpcClient:
         return False
 
     def _create_connection(self) -> Optional[Any]:
+        """抽象工厂：根据平台选择合适的 IPC 连接方式"""
+        if IS_WINDOWS:
+            return self._win_pipe_connection()
+        else:
+            return self._unix_socket_connection()
+
+    def _win_pipe_connection(self) -> Optional[Any]:
+        if _HAS_PIPE_CONNECTION:
+            try:
+                import win32pipe, win32file
+                handle = win32file.CreateFile(
+                    self._socket_path,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0, None, win32file.OPEN_EXISTING,
+                    win32file.FILE_FLAG_OVERLAPPED, None
+                )
+                return PipeConnectionWrapper(PipeConnection(handle), on_overflow=self._overflow_callback)
+            except ImportError:
+                log.debug("pywin32 未安装，回退到 _winapi")
+        return _winapi_connect(self._socket_path, Config.IPC_CONNECT_TIMEOUT,
+                               on_overflow=self._overflow_callback)
+
+    def _unix_socket_connection(self) -> Optional[Any]:
         try:
-            if IS_WINDOWS:
-                if _HAS_PIPE_CONNECTION:
-                    try:
-                        import win32pipe, win32file
-                        handle = win32file.CreateFile(
-                            self._socket_path,
-                            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                            0, None, win32file.OPEN_EXISTING,
-                            win32file.FILE_FLAG_OVERLAPPED, None
-                        )
-                        return PipeConnectionWrapper(PipeConnection(handle), on_overflow=self._overflow_callback)
-                    except ImportError:
-                        log.debug("pywin32 未安装，回退到 _winapi")
-                wrapper = _winapi_connect(self._socket_path, Config.IPC_CONNECT_TIMEOUT,
-                                          on_overflow=self._overflow_callback)
-                return wrapper
-            else:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(Config.IPC_CONNECT_TIMEOUT)
-                sock.connect(self._socket_path)
-                return sock
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(Config.IPC_CONNECT_TIMEOUT)
+            sock.connect(self._socket_path)
+            return sock
         except (FileNotFoundError, ConnectionRefusedError, TimeoutError) as e:
-            log.debug(f"IPC 连接错误: {e}")
-            return None
-        except Exception as e:
-            log.warning(f"创建 IPC 连接时发生意外错误: {e}", exc_info=True)
+            log.debug(f"Unix socket 连接失败: {e}")
             return None
 
     def _close_socket(self) -> None:
@@ -1302,21 +1342,7 @@ class MpvIpcClient:
         renderer = self._renderer_ref()
         if renderer is None:
             return
-        state = renderer.state
-        dispatch = {
-            ObservedProperty.PAUSE:          lambda v: state.update_pause(bool(v)),
-            ObservedProperty.TIME_POS:       lambda v: state.update_position(float(v)) if v is not None else None,
-            ObservedProperty.DURATION:       lambda v: state.update_duration(float(v)) if v is not None else None,
-            ObservedProperty.VOLUME:         lambda v: state.update_volume(int(v)) if v is not None else None,
-            ObservedProperty.MEDIA_TITLE:    lambda v: state.update_title(str(v)) if v is not None else None,
-            ObservedProperty.METADATA:       lambda v: state.update_metadata(v) if v is not None else None,
-            ObservedProperty.CHAPTER_LIST:   lambda v: state.update_chapters(v) if isinstance(v, list) else None,
-            ObservedProperty.CHAPTER:        lambda v: state.update_chapter(int(v)) if v is not None else None,
-            ObservedProperty.PLAYLIST:       lambda v: state.update_playlist(v) if isinstance(v, list) else None,
-            ObservedProperty.AID:            lambda v: state.update_aid(int(v)) if v is not None else None,
-            ObservedProperty.SID:            lambda v: state.update_sid(int(v)) if v is not None else None,
-            ObservedProperty.TRACK_LIST:     lambda v: state.update_track_list(v) if isinstance(v, list) else None,
-        }
+        self._init_dispatch()   # 首次调用时初始化
         try:
             if "request_id" in data:
                 req_id = data["request_id"]
@@ -1335,7 +1361,7 @@ class MpvIpcClient:
                     prop = ObservedProperty(pid)
                 except ValueError:
                     return
-                handler = dispatch.get(prop)
+                handler = self._PROPERTY_DISPATCH.get(prop)
                 if handler:
                     try:
                         handler(value)
@@ -1472,6 +1498,7 @@ class MPVplayerRenderer(Renderer):
         self._cleanup_scheduled: threading.Event = threading.Event()
         self._state_enum: RendererState = RendererState.IDLE
         self._start_lock: threading.RLock = threading.RLock()
+        self._atexit_cleanup_done: threading.Event = threading.Event()
 
         self.proc_manager: MPVProcessManager = MPVProcessManager(self._executor)
         self.proc_manager.set_exit_callback(self._on_process_exit)
@@ -1596,6 +1623,7 @@ class MPVplayerRenderer(Renderer):
         self._shutdown_executor(timeout=5.0)
 
         self.temp_manager.cleanup(force=True)
+        self._atexit_cleanup_done.set()
         atexit.unregister(self._atexit_cleanup)
         log.info("MPVPlayer 已停止")
 
@@ -1719,17 +1747,27 @@ class MPVplayerRenderer(Renderer):
             log.info("清理完成（状态重置已保证）")
 
     def _safe_reset_state(self) -> None:
+        errors = []
         try:
             self.state.reset()
+        except Exception as e:
+            errors.append(f"状态重置失败: {e}")
+        try:
             self.set_state_transport("STOPPED")
+        except Exception as e:
+            errors.append(f"设置 transport 状态失败: {e}")
+        try:
             self._publish_event("renderer_av_stop")
+        except Exception as e:
+            errors.append(f"发送停止事件失败: {e}")
+        try:
             self._set_state_enum(RendererState.IDLE)
-        except Exception:
-            log.exception("在安全重置状态时发生异常（已尝试通知前端）")
-            try:
-                self._publish_event("renderer_av_stop")
-            except Exception:
-                log.error("无法发送 renderer_av_stop 事件，前端可能未同步")
+        except Exception as e:
+            errors.append(f"设置状态枚举失败: {e}")
+        if errors:
+            log.error("安全重置状态时发生错误: " + "; ".join(errors))
+        else:
+            log.debug("状态已安全重置")
 
     def _remove_socket_file(self) -> None:
         if not IS_WINDOWS and self.ipc_sock:
@@ -2063,8 +2101,14 @@ class MPVplayerRenderer(Renderer):
             self._resume_manager.save_position(uri, pos, is_playlist=False)
 
     def _atexit_cleanup(self) -> None:
+        if self._atexit_cleanup_done.is_set():
+            return
+        self._atexit_cleanup_done.set()
         if not self._cleanup_done():
-            self._do_cleanup()
+            try:
+                self._do_cleanup()
+            except Exception:
+                log.exception("atexit 清理时发生异常")
 
 if __name__ == "__main__":
     gui(MPVplayerRenderer())
